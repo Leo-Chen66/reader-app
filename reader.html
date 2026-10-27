@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>墨阅 · 本地 TXT 阅读器（MVP）</title>
+<style>
+  :root{
+    --bg:#FAFAF8; --ink:#2B2B2B; --muted:#8A8A85; --line:#E8E6E0;
+    --accent:#4A7A6F; --bar-h:52px; --fs:18px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--ink);font-family:Georgia,"Noto Serif SC","Songti SC",SimSun,serif;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+
+  /* 顶栏 */
+  header{
+    height:var(--bar-h);flex:0 0 auto;display:flex;align-items:center;gap:14px;
+    padding:0 18px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.9);
+    backdrop-filter:blur(6px);
+  }
+  header .book{font-size:14px;color:var(--ink);max-width:30%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  header .pct{font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums;min-width:52px}
+  header .spacer{flex:1}
+  button{
+    border:1px solid var(--line);background:#fff;color:var(--ink);border-radius:8px;
+    padding:6px 12px;font-size:13px;cursor:pointer;font-family:inherit;transition:all .15s;
+  }
+  button:hover{border-color:var(--accent);color:var(--accent)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.primary:hover{filter:brightness(1.06)}
+  #openBtn{display:none}
+  #fileInput{display:none}
+
+  /* 阅读区 */
+  main{flex:1;overflow-y:auto;scroll-behavior:auto}
+  .sheet{max-width:720px;margin:0 auto;padding:48px 24px 30vh;line-height:1.8;font-size:var(--fs)}
+  .sheet p{margin-bottom:.8em;text-align:justify}
+  .toast{
+    position:fixed;left:50%;bottom:36px;transform:translateX(-50%) translateY(20px);
+    background:#333;color:#fff;font-size:13px;padding:9px 18px;border-radius:20px;
+    opacity:0;pointer-events:none;transition:all .3s;font-family:system-ui;
+  }
+  .toast.show{opacity:.92;transform:translateX(-50%) translateY(0)}
+
+  /* 空状态 */
+  .empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px}
+  .empty .mark{font-size:64px;color:var(--accent);opacity:.85}
+  .empty h1{font-size:26px;font-weight:600;letter-spacing:.35em;text-indent:.35em}
+  .empty p{font-size:13px;color:var(--muted);font-family:system-ui}
+  .empty kbd{border:1px solid var(--line);background:#fff;border-radius:6px;padding:1px 7px;font-family:ui-monospace,monospace}
+  .hidden{display:none}
+  footer{height:34px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--muted);border-top:1px solid var(--line);font-family:system-ui}
+</style>
+</head>
+<body>
+
+<header>
+  <span class="book hidden" id="bookName"></span>
+  <span class="pct" id="pct">0%</span>
+  <span class="spacer"></span>
+  <button id="fsDown" title="减小字号">A－</button>
+  <button id="fsUp" title="增大字号">A＋</button>
+  <button class="primary" id="openBtn">打开 TXT</button>
+</header>
+
+<div class="empty" id="empty">
+  <div class="mark">卷</div>
+  <h1>墨 阅</h1>
+  <p>点击下方按钮导入本地 TXT 文件，进度自动保存</p>
+  <button class="primary" id="emptyBtn">选择文件</button>
+  <p>支持 UTF-8 / GBK 编码，全部本地处理，不联网</p>
+</div>
+
+<main id="main" class="hidden"><div class="sheet" id="sheet"></div></main>
+<div class="toast" id="toast"></div>
+<footer>墨阅 MVP · 进度每 0.5 秒自动保存</footer>
+
+<input type="file" id="fileInput" accept=".txt,text/plain">
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const KEY = n => 'reader:progress:' + n;
+const SET = 'reader:settings';
+let curName = null, saving = false;
+
+/* ---------- 编码识别：BOM → UTF-8 严格解码 → GBK 回退 ---------- */
+function decode(buf){
+  const u8 = new Uint8Array(buf);
+  if (u8[0]===0xEF && u8[1]===0xBB && u8[2]===0xBF) return { text:new TextDecoder('utf-8').decode(u8.slice(3)), enc:'UTF-8' };
+  if (u8[0]===0xFF && u8[1]===0xFE) return { text:new TextDecoder('utf-16le').decode(u8.slice(2)), enc:'UTF-16LE' };
+  try { return { text:new TextDecoder('utf-8',{fatal:true}).decode(u8), enc:'UTF-8' }; }
+  catch(e){ return { text:new TextDecoder('gbk').decode(u8), enc:'GBK' }; }
+}
+
+function toast(msg){
+  const t = $('toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toast._h); toast._h = setTimeout(()=>t.classList.remove('show'), 2200);
+}
+
+/* ---------- 打开文件 ---------- */
+function openFile(file){
+  if (!file) return;
+  file.arrayBuffer().then(buf=>{
+    if (buf.byteLength === 0) return toast('这是一个空文件，换一个试试');
+    const { text, enc } = decode(buf);
+    curName = file.name;
+    $('sheet').innerHTML = '';
+    text.split(/\r\n|\r|\n/).forEach(line=>{
+      const p = document.createElement('p');
+      p.textContent = line || '\u00A0';
+      $('sheet').appendChild(p);
+    });
+    $('empty').classList.add('hidden');
+    $('main').classList.remove('hidden');
+    $('bookName').classList.remove('hidden');
+    $('bookName').textContent = file.name;
+    $('openBtn').style.display = '';
+    const st = localStorage.getItem(KEY(file.name));
+    $('main').scrollTop = st ? restoreRatio(JSON.parse(st)) : 0;
+    toast('已打开（' + enc + ' 编码' + (st ? '，已定位到上次阅读位置' : '') + '）');
+  }).catch(()=>toast('文件读取失败'));
+}
+
+function restoreRatio(st){
+  const h = $('main').scrollHeight - $('main').clientHeight;
+  const byRatio = h > 0 ? Math.round(h * (st.ratio || 0)) : 0;
+  return (st.fontSize !== fontSize) ? byRatio : (st.scrollTop || byRatio);
+}
+
+/* ---------- 进度：500ms 节流 + beforeunload 兜底 ---------- */
+let fontSize = (()=>{ try{ return JSON.parse(localStorage.getItem(SET)).fontSize || 18; }catch(e){ return 18; } })();
+function applyFs(){ document.documentElement.style.setProperty('--fs', fontSize+'px'); localStorage.setItem(SET, JSON.stringify({fontSize})); }
+applyFs();
+
+let last = 0, pend = null;
+$('main').addEventListener('scroll', ()=>{
+  if (!curName) return;
+  updatePct();
+  const now = Date.now();
+  if (now - last < 500){ if(!pend) pend = setTimeout(()=>{ pend=null; save(); }, 500-(now-last)); return; }
+  last = now; save();
+}, {passive:true});
+
+function save(){
+  const m = $('main');
+  const h = m.scrollHeight - m.clientHeight;
+  localStorage.setItem(KEY(curName), JSON.stringify({
+    scrollTop: m.scrollTop, ratio: h>0 ? m.scrollTop/h : 0,
+    fontSize, updatedAt: Date.now()
+  }));
+}
+addEventListener('beforeunload', ()=>{ if(curName) save(); });
+
+function updatePct(){
+  const m = $('main');
+  const h = m.scrollHeight - m.clientHeight;
+  $('pct').textContent = (h>0 ? Math.min(100, Math.round(m.scrollTop/h*100)) : 0) + '%';
+}
+
+/* ---------- 字号 ---------- */
+$('fsUp').onclick = ()=>{ fontSize = Math.min(26, fontSize+2); applyFs(); updatePct(); toast('字号 '+fontSize); };
+$('fsDown').onclick = ()=>{ fontSize = Math.max(14, fontSize-2); applyFs(); updatePct(); toast('字号 '+fontSize); };
+
+/* ---------- 入口 ---------- */
+$('fileInput').onchange = e => { openFile(e.target.files[0]); e.target.value=''; };
+$('openBtn').onclick = ()=> $('fileInput').click();
+$('emptyBtn').onclick = ()=> $('fileInput').click();
+addEventListener('keydown', e=>{ if(e.key==='o' && (e.ctrlKey||e.metaKey)){ e.preventDefault(); $('fileInput').click(); } });
+</script>
+</body>
+</html>
